@@ -58,14 +58,16 @@ def extract_vm_info(vm_str):
         vm_type = "SDU_A"
     elif "SPU_CGW" in vm_name_upper:
         vm_type = "SPU_CGW"
-    elif "SPU_O" in vm_name_upper:
-        vm_type = "SPU_O"
     elif "SPU_B" in vm_name_upper:
         vm_type = "SPU_B"
     elif "SPU_C" in vm_name_upper:
         vm_type = "SPU_C"
     elif "SPU_K1" in vm_name_upper:
         vm_type = "SPU_K1"
+    elif "SPU_O" in vm_name_upper:
+        vm_type = "SPU_O"
+    elif "SPU_P" in vm_name_upper:
+        vm_type = "SPU_P"
     elif "SPU_J_ARM" in vm_name_upper:
         vm_type = "SPU_J_ARM"
     elif "SPU_J" in vm_name_upper:
