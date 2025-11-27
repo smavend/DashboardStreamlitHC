@@ -25,20 +25,63 @@ st.markdown("App interactiva para monitorear porcentajes de CPU por VM y NE Name
 def extract_vm_info(vm_str):
     """
     Extrae el VM Name y el VM Type de la cadena raw del CSV.
-    Ejemplo raw: "nodeName=VNFP, VM Name=SPU_CGW_0080"
+    Soporta dos formatos:
+    1. Old: "nodeName=VNFP, VM Name=SPU_CGW_0080"
+    2. New: "Virtual machine name=VES_SBC08_BSU_3"
     Retorna: (vm_name, vm_type)
     """
     if pd.isna(vm_str):
         return None, None
     
+    vm_str = str(vm_str).strip()
+    
+    # --- FORMATO NUEVO ---
+    # Ejemplo: "Virtual machine name=VES_SBC08_BSU_3"
+    if "Virtual machine name=" in vm_str:
+        try:
+            # Extraer el valor después del igual
+            full_vm_name = vm_str.split("Virtual machine name=")[1].strip()
+            
+            parts = full_vm_name.split('_')
+            
+            # Regla: Retirar site y nombre del equipo (primeras 1 partes)
+            # Ejemplo: ARQ_SBCOMU02_OMUSBIG2_1 -> [ARQ, SBCOMU02, OMUSBIG2, 1] -> SBCOMU02_OMUSBIG2_1
+            
+            if len(parts) > 1:
+                # VM Name: Desde la 2ra parte hasta el final
+                vm_name = "_".join(parts[1:])
+                
+                # VM Type: Desde la 2ra parte hasta el penúltimo
+                # (Es decir, el nuevo VM Name sin el último segmento)
+                if len(parts) > 2:
+                    vm_type = "_".join(parts[1:-1])
+                else:
+                    # Caso borde: A_B_C -> VM Name=C. Type?
+                    # Si solo queda una parte en el nombre (ej. C), el tipo podría ser C o UNKNOWN.
+                    # Asumiremos que es esa misma parte si no hay sufijo numérico claro, o UNKNOWN.
+                    # Para consistencia con "hasta el último guion bajo", si no hay guiones en el nuevo nombre,
+                    # tomamos todo el nombre.
+                    vm_type = vm_name
+            else:
+                # Fallback si no tiene la estructura esperada (menos de 2 partes)
+                vm_name = full_vm_name
+                vm_type = "UNKNOWN"
+                
+            return vm_name, vm_type
+        except Exception:
+            return vm_str, "ERROR"
+
+    # --- FORMATO ANTIGUO ---
+    # Ejemplo raw: "nodeName=VNFP, VM Name=SPU_CGW_0080"
+    
     # Extraer VM Name
-    match_name = re.search(r"VM Name=([^,\"]+)", str(vm_str))
+    match_name = re.search(r"VM Name=([^,\"]+)", vm_str)
     if match_name:
         vm_name = match_name.group(1).strip()
     else:
-        vm_name = str(vm_str).strip()
+        vm_name = vm_str
     
-    # Extraer VM Type
+    # Extraer VM Type (Lógica original)
     vm_name_upper = vm_name.upper()
     
     # REGLAS ESPECÍFICAS (Orden de prioridad)
@@ -138,10 +181,49 @@ def generate_color_map(df):
             r, g, b = colorsys.hls_to_rgb(base_hue, lightness, saturation)
             color_hex = f'#{int(r*255):02x}{int(g*255):02x}{int(b*255):02x}'
             
-            legend_key = f"{ne} - {vm_type}"
+            legend_key = f"{vm_type}"
             color_map[legend_key] = color_hex
     
     return color_map
+
+def generate_color_map_single_ne(df, ne_name):
+    """
+    Genera un mapa de colores para un solo NE usando diferentes hues de la paleta
+    para cada VM Type (en lugar de variaciones del mismo tono).
+    """
+    FIXED_HUES = [
+        0.00,  # Rojo
+        0.10,  # Rojo-naranja
+        0.20,  # Naranja
+        0.30,  # Amarillo
+        0.40,  # Amarillo-verde
+        0.50,  # Verde
+        0.60,  # Verde-cian
+        0.70,  # Cian
+        0.80,  # Azul
+        0.90,  # Magenta
+    ]
+    
+    vm_types = sorted(df[df["NE Name"] == ne_name]["VM_Type"].unique())
+    
+    color_map = {}
+    for i, vm_type in enumerate(vm_types):
+        # Asignar un hue diferente a cada VM Type
+        hue = FIXED_HUES[i % len(FIXED_HUES)]
+        
+        # Usar saturación y luminosidad fijas para colores vibrantes
+        saturation = 0.85
+        lightness = 0.60
+        
+        # Convertir HSL a RGB
+        r, g, b = colorsys.hls_to_rgb(hue, lightness, saturation)
+        color_hex = f'#{int(r*255):02x}{int(g*255):02x}{int(b*255):02x}'
+        
+        legend_key = f"{vm_type}"
+        color_map[legend_key] = color_hex
+    
+    return color_map
+
 
 @st.cache_data
 def load_data(uploaded_file):
@@ -158,15 +240,17 @@ def load_data(uploaded_file):
         uploaded_file.seek(0)
         df = pd.read_csv(uploaded_file, skiprows=header_row)
         
-        # Limpieza de columnas
+        # Limpieza de columnas (strip whitespace)
         df.columns = [c.strip() for c in df.columns]
         
-        # Validar columnas
-        required_cols = ["Start Time", "NE Name", "VM", "CPU usage (%)"]
-        if not all(col in df.columns for col in required_cols):
+        # Validar columnas mínimas requeridas
+        # Nota: "CPU usage" puede variar de nombre, lo validamos después
+        required_cols_base = ["Start Time", "NE Name", "VM"]
+        if not all(col in df.columns for col in required_cols_base):
             return None
 
         # Procesar fechas
+        # Intentar inferir formato, soporta ISO y formatos locales
         df["Date"] = pd.to_datetime(df["Start Time"], errors='coerce')
         
         # Procesar VM Info
@@ -174,10 +258,18 @@ def load_data(uploaded_file):
         df["VM_Name"] = [x[0] for x in vm_info]
         df["VM_Type"] = [x[1] for x in vm_info]
         
-        # Asegurar CPU numérico
-        df["CPU_Usage"] = pd.to_numeric(df["CPU max usage (%)"], errors='coerce')
-        # df["CPU_Average_Usage"] = pd.to_numeric(df["CPU average usage (%)"], errors='coerce')
-        
+        # Procesar CPU Usage (Soporte para ambos formatos)
+        if "Maximum CPU Load (%)" in df.columns:
+            # Nuevo formato
+            df["CPU_Usage"] = pd.to_numeric(df["Mean CPU Load (%)"], errors='coerce')
+        elif "CPU max usage (%)" in df.columns:
+            # Viejo formato
+            df["CPU_Usage"] = pd.to_numeric(df["CPU average usage (%)"], errors='coerce')
+        else:
+            # Fallback o error
+            st.error("No se encontró columna de CPU (Maximum CPU Load (%) o CPU max usage (%))")
+            return None
+            
         # Eliminar filas inválidas
         df = df.dropna(subset=["Date", "CPU_Usage", "VM_Name"])
         
@@ -217,6 +309,9 @@ if uploaded_files:
             max_value=max_date.date()
         )
         
+        st.sidebar.markdown("---")
+        
+        # --- FILTROS ---
         all_nes = sorted(df["NE Name"].unique())
         selected_nes = st.sidebar.multiselect("NE Name", all_nes, default=all_nes)
         
@@ -264,37 +359,190 @@ if uploaded_files:
             df_trend = df_trend.sort_values(["VM_Name", "Date"])
             
             # Crear columna combinada para la leyenda
-            df_trend["Legend"] = df_trend["NE Name"] + " - " + df_trend["VM_Type"]
+            df_trend["Legend"] = df_trend["VM_Type"]
             
             # Generar mapa de colores personalizado
             color_map = generate_color_map(df_trend)
             
-            # Usar px.line con line_group para conectar puntos de la misma VM
-            fig_line = px.line(
-                df_trend, 
-                x="Date", 
-                y="CPU_Usage", 
-                color="Legend",
-                line_group="VM_Name", # Conecta solo puntos de la misma VM
-                markers=True, # Mostrar puntos
-                title="CPU Usage (Promedio cada 2 Horas)",
-                template="plotly_white", # Tema limpio
-                color_discrete_map=color_map # Aplicar colores personalizados
-            )
+            # Obtener NE Names únicos seleccionados
+            unique_nes = sorted(df_trend["NE Name"].unique())
             
-            # Ajustes estéticos avanzados
-            fig_line.update_traces(
-                marker=dict(size=4, opacity=0.8), 
-                line=dict(width=2),
-                opacity=0.8 # Transparencia general para ver densidad
-            )
-            
-            # Hover unificado para comparar valores en el mismo instante
-            fig_line.update_layout(
-                hovermode="x unified"
-            )
-            
-            st.plotly_chart(fig_line, use_container_width=True)
+            # --- LÓGICA DE DISTRIBUCIÓN DE GRÁFICOS ---
+            if len(unique_nes) == 1:
+                # CASO 1: Un solo NE Name -> Gráfico de ancho completo
+                ne_name = unique_nes[0]
+                df_ne = df_trend[df_trend["NE Name"] == ne_name].copy()
+                
+                # Usar mapa de colores con diferentes hues para cada VM Type
+                color_map_single = generate_color_map_single_ne(df_trend, ne_name)
+                
+                fig_line = px.line(
+                    df_ne, 
+                    x="Date", 
+                    y="CPU_Usage", 
+                    color="Legend",
+                    line_group="VM_Name",
+                    markers=True,
+                    title=f"CPU Usage - {ne_name} (Promedio cada 2 Horas)",
+                    template="plotly_white",
+                    color_discrete_map=color_map_single
+                )
+                
+                fig_line.update_traces(
+                    marker=dict(size=4, opacity=0.8), 
+                    line=dict(width=2),
+                    opacity=0.8
+                )
+                
+                fig_line.update_layout(
+                    hovermode="closest",
+                    legend=dict(
+                        orientation="v",
+                        yanchor="top",
+                        y=1,
+                        xanchor="left",
+                        x=1.02
+                    )
+                )
+
+                fig_line.update_yaxes(range=[0, 100])
+                
+                st.plotly_chart(fig_line, use_container_width=True)
+                
+            else:
+                # CASO 2: Múltiples NE Names -> Gráficos distribuidos 2 por fila con paginación
+                
+                # Configuración de paginación
+                GRAPHS_PER_PAGE = 6
+                total_nes = len(unique_nes)
+                total_pages = (total_nes + GRAPHS_PER_PAGE - 1) // GRAPHS_PER_PAGE  # Redondear hacia arriba
+                
+                # Inicializar página actual en session state
+                if 'current_page' not in st.session_state:
+                    st.session_state.current_page = 0
+                
+                # Controles de paginación
+                col_info, col_prev, col_next = st.columns([3, 1, 1])
+                
+                # Calcular índices para la página actual
+                start_idx = st.session_state.current_page * GRAPHS_PER_PAGE
+                end_idx = min(start_idx + GRAPHS_PER_PAGE, total_nes)
+                page_nes = unique_nes[start_idx:end_idx]
+                
+                # Generar gráficos para la página actual (2 por fila)
+                for i in range(0, len(page_nes), 2):
+                    cols = st.columns(2)
+                    
+                    # Primer gráfico de la fila
+                    with cols[0]:
+                        try:
+                            ne_name = page_nes[i]
+                            df_ne = df_trend[df_trend["NE Name"] == ne_name].copy()
+                            
+                            # Usar mapa de colores con diferentes hues para cada VM Type
+                            color_map_single = generate_color_map_single_ne(df_trend, ne_name)
+                            
+                            if df_ne.empty:
+                                st.warning(f"No hay datos para {ne_name}")
+                            else:
+                                fig_line = px.line(
+                                    df_ne, 
+                                    x="Date", 
+                                    y="CPU_Usage", 
+                                    color="Legend",
+                                    line_group="VM_Name",
+                                    markers=True,
+                                    title=f"{ne_name}",
+                                    template="plotly_white",
+                                    color_discrete_map=color_map_single
+                                )
+                                
+                                fig_line.update_traces(
+                                    marker=dict(size=4, opacity=0.8), 
+                                    line=dict(width=2),
+                                    opacity=0.8
+                                )
+                                
+                                fig_line.update_layout(
+                                    hovermode="closest",
+                                    legend=dict(
+                                        orientation="v",
+                                        yanchor="top",
+                                        y=1,
+                                        xanchor="left",
+                                        x=1.02
+                                    )
+                                )
+
+                                fig_line.update_yaxes(range=[0, 100])
+                                
+                                st.plotly_chart(fig_line, use_container_width=True)
+                        except Exception as e:
+                            st.error(f"Error al generar gráfico para {page_nes[i]}: {str(e)}")
+                    
+                    # Segundo gráfico de la fila (si existe)
+                    if i + 1 < len(page_nes):
+                        with cols[1]:
+                            try:
+                                ne_name = page_nes[i + 1]
+                                df_ne = df_trend[df_trend["NE Name"] == ne_name].copy()
+                                
+                                
+                                color_map_single = generate_color_map_single_ne(df_trend, ne_name)
+                                if df_ne.empty:
+                                    st.warning(f"No hay datos para {ne_name}")
+                                else:
+                                    fig_line = px.line(
+                                        df_ne, 
+                                        x="Date", 
+                                        y="CPU_Usage", 
+                                        color="Legend",
+                                        line_group="VM_Name",
+                                        markers=True,
+                                        title=f"{ne_name}",
+                                        template="plotly_white",
+                                        color_discrete_map=color_map_single
+                                    )
+                                    
+                                    fig_line.update_traces(
+                                        marker=dict(size=4, opacity=0.8), 
+                                        line=dict(width=2),
+                                        opacity=0.8
+                                    )
+                                    
+                                    fig_line.update_layout(
+                                        hovermode="closest",
+                                        legend=dict(
+                                            orientation="v",
+                                            yanchor="top",
+                                            y=1,
+                                            xanchor="left",
+                                            x=1.02
+                                        )
+                                    )
+
+                                    fig_line.update_yaxes(range=[0, 100])
+                                    
+                                    st.plotly_chart(fig_line, use_container_width=True)
+                            except Exception as e:
+                                st.error(f"Error al generar gráfico para {page_nes[i + 1]}: {str(e)}")
+                
+                # Controles de paginación al final también
+                st.markdown("---")
+                col_prev2, col_info2, col_next2 = st.columns([1, 3, 1])
+                
+                with col_prev2:
+                    if st.button("⬅️ Anterior ", key="prev_bottom", disabled=(st.session_state.current_page == 0)):
+                        st.session_state.current_page -= 1
+                        st.rerun()
+                
+                with col_info2:
+                    st.info(f"Página {st.session_state.current_page + 1} de {total_pages}")
+                
+                with col_next2:
+                    if st.button("Siguiente ➡️ ", key="next_bottom", disabled=(st.session_state.current_page >= total_pages - 1)):
+                        st.session_state.current_page += 1
+                        st.rerun()
             
             # --- OTRAS GRÁFICAS ---
             col_left, col_right = st.columns(2)
